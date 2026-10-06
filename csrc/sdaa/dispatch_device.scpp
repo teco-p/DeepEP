@@ -64,8 +64,10 @@ __device__ void get_token_distributed(int num_tokens, int topk, int ep_size,
 
         for (int token = 0; token < count; ++token) {
             for (int expert = 0; expert < topk; ++expert) {
-                const int card = divide32(indices[static_cast<long>(token) * topk + expert],
-                                          local_expert_num);
+                const int id = indices[static_cast<long>(token) * topk + expert];
+                // DeepEP's invalid top-k sentinel must not enter the card union.
+                if (id < 0) continue;
+                const int card = divide32(id, local_expert_num);
                 flags[static_cast<long>(token) * ep_size + card] = 1;
             }
         }
