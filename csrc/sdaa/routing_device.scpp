@@ -20,86 +20,6 @@ __global__ void cast_indices_kernel(const void* input, int bits, int* output,
     }
 }
 
-__global__ void compact_kernel(const void* hidden, const int* ids, const float* weights,
- const int* counts, void* output, int* out_ids, float* out_weights, int* rank_prefix,
- int* expert_prefix, int* inverse, int* source, int capacity, int width, int rank,
- int64_t* status) {
-    if (RPEN() == 0) {
-        int total = 0, used = 0;
-        int expert_counts[24] = {};
-        const int begin = rank * 24;
-        for (int dp = 0; dp < 4; ++dp) {
-            const int next = total + counts[dp];
-            if (counts[dp] < 0 || next > capacity) {
-                if (status[0] == 0) { status[0] = 2; status[1] = dp; status[2] = next; }
-                break;
-            }
-            for (int row = total; row < next; ++row) {
-                bool present = false;
-                for (int k = 0; k < 6; ++k) {
-                    const int id = ids[row * 6 + k];
-                    if (id >= begin && id < begin + 24) {
-                        ++expert_counts[id - begin]; present = true;
-                    }
-                }
-                if (present) {
-                    inverse[used] = row;
-                    source[used * 2] = dp * 4;
-                    // Native payload tail carries original source row as opaque uint16.
-                    source[used * 2 + 1] = static_cast<const uint16_t*>(hidden)[row * (width + 16) + width];
-                    ++used;
-                }
-            }
-            for (int tp = 0; tp < 4; ++tp) rank_prefix[dp * 4 + tp] = used;
-            total = next;
-        }
-        int prefix = 0;
-        for (int e = 0; e < 24; ++e) { prefix += expert_counts[e]; expert_prefix[e] = prefix; }
-    }
-    sdaa::sync_threads();
-    if (status[0] != 0) return;
-    // Each SPE copies complete rows through its own SPM storage.
-    char* values = static_cast<char*>(libos_ldm_malloc(static_cast<unsigned long>(width) * 2, 0));
-    const int begin = rank * 24;
-    for (int dst = static_cast<int>(RPEN()); dst < capacity; dst += 32) {
-        const int src = inverse[dst];
-        if (src < 0) continue;
-        if (src >= capacity) {
-            if (RPEN() == 0 && status[0] == 0) status[0] = 3;
-            continue;
-        }
-        memcpy(values, static_cast<const char*>(hidden) + static_cast<long>(src) * (width + 16) * 2,
-               static_cast<unsigned long>(width) * 2);
-        memcpy(static_cast<char*>(output) + static_cast<long>(dst) * width * 2, values,
-               static_cast<unsigned long>(width) * 2);
-        for (int k = 0; k < 6; ++k) {
-            const int id = ids[src * 6 + k];
-            const bool local = id >= begin && id < begin + 24;
-            out_ids[dst * 6 + k] = local ? id : -1;
-            out_weights[dst * 6 + k] = local ? weights[src * 6 + k] : 0.f;
-        }
-    }
-    libos_ldm_free(values);
-}
-
-__global__ void scatter_kernel(const void* input, const int* inverse, void* output,
- int capacity, int width, int64_t* status) {
-    char* row = static_cast<char*>(libos_ldm_malloc(static_cast<unsigned long>(width) * 2, 0));
-    for (int src = static_cast<int>(RPEN()); src < capacity; src += 32) {
-        const int dst = inverse[src];
-        if (dst < 0) continue;
-        if (dst >= capacity) {
-            if (RPEN() == 0 && status[0] == 0) status[0] = 4;
-            continue;
-        }
-        memcpy(row, static_cast<const char*>(input) + static_cast<long>(src) * width * 2,
-               static_cast<unsigned long>(width) * 2);
-        memcpy(static_cast<char*>(output) + static_cast<long>(dst) * width * 2, row,
-               static_cast<unsigned long>(width) * 2);
-    }
-    libos_ldm_free(row);
-}
-
 namespace {
 __device__ inline void expanded_error(int64_t* status, int64_t code,
                                      int64_t item, int64_t value, int64_t bound) {
@@ -260,18 +180,5 @@ extern "C" sdaaError_t deep_ep_combine_expanded(sdaaStream_t stream,
 extern "C" sdaaError_t deep_ep_cast_indices(sdaaStream_t stream, const void* input,
  int bits, int* output, int count, int experts, int64_t* status) {
     cast_indices_kernel<<<1, stream>>>(input, bits, output, count, experts, status);
-    return sdaaGetLastError();
-}
-extern "C" sdaaError_t deep_ep_compact(sdaaStream_t stream, const void* hidden,
- const int* ids, const float* weights, const int* counts, void* output, int* out_ids,
- float* out_weights, int* rank_prefix, int* expert_prefix, int* inverse, int* source,
- int capacity, int width, int rank, int64_t* status) {
-    compact_kernel<<<1, stream>>>(hidden, ids, weights, counts, output, out_ids,
-        out_weights, rank_prefix, expert_prefix, inverse, source, capacity, width, rank, status);
-    return sdaaGetLastError();
-}
-extern "C" sdaaError_t deep_ep_scatter(sdaaStream_t stream, const void* input,
- const int* inverse, void* output, int capacity, int width, int64_t* status) {
-    scatter_kernel<<<1, stream>>>(input, inverse, output, capacity, width, status);
     return sdaaGetLastError();
 }
