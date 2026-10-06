@@ -36,6 +36,9 @@ if(SDAA_COMPILER)
         if(NOT device_source STREQUAL "gather_device")
             list(APPEND device_dependencies include/device_sync.hpp)
         endif()
+        if(device_source STREQUAL "routing_device")
+            list(APPEND device_dependencies include/expanded_layout.hpp)
+        endif()
         add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${device_source}.o"
             COMMAND "${SDAA_COMPILER}" -I "${SDAA_INCLUDE_DIR}"
                 -U__CUDA_ARCH__ -DUSE_EXPERIMENTAL_SDAA_API -flto -fPIC

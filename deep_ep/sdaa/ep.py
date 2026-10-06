@@ -11,15 +11,20 @@ from .. import _sdaa
 
 
 class EventOverlap:
-    def __init__(self, event=None, extra_tensors=()):
-        self.event = event
+    """Synchronous-API same-stream ordering and tensor lifetime, not GPU completion.
+
+    Like DeepEP's async_finish=False return, no event is manufactured. SDAA
+    event recording is not supported inside capture; cross-stream use is denied.
+    """
+    def __init__(self, stream, extra_tensors=()):
+        self.event = None
+        self.stream = stream
         self.extra_tensors = extra_tensors
 
     def current_stream_wait(self, release_handle=False):
-        if self.event is not None:
-            torch.sdaa.current_stream().wait_event(self.event)
+        if torch.sdaa.current_stream() != self.stream:
+            raise ValueError("SDAA synchronous EP overlap cannot transfer a cross-stream dependency")
         if release_handle:
-            self.event = None
             self.extra_tensors = ()
 
     wait = current_stream_wait
@@ -32,7 +37,7 @@ class EPHandle:
     version: object
     num_experts: int
     num_max_tokens_per_rank: int
-    num_recv_tokens: int
+    num_recv_tokens: torch.Tensor
     psum_num_recv_tokens_per_scaleup_rank: torch.Tensor
     psum_num_recv_tokens_per_expert: torch.Tensor
     recv_src_metadata: torch.Tensor
@@ -42,7 +47,11 @@ class EPHandle:
     send_counts: torch.Tensor
     original_shape: tuple
     retained: tuple
-    do_expand: bool = False
+    num_unaligned_recv_tokens_per_expert: torch.Tensor
+    num_padded_recv_tokens_per_expert: torch.Tensor
+    num_expanded_tokens: torch.Tensor
+    stream: object
+    do_expand: bool = True
     expert_alignment: int = 1
     num_recv_tokens_per_expert_list: object = None
 
@@ -56,10 +65,12 @@ class EPHandle:
 class EPBuffer:
     def __init__(self, group, num_bytes=64 * 1024 * 1024, *,
                  num_max_tokens_per_rank, hidden=5120, num_topk=6,
-                 num_experts=384, tp_replica_size=4):
+                 num_experts=384, tp_replica_size=4, expert_alignment=1):
         if (dist.get_world_size(group) != 16 or tp_replica_size != 4
                 or hidden != 5120 or num_topk != 6 or num_experts != 384
-                or not 0 < num_max_tokens_per_rank <= 16000):
+                or not 0 < num_max_tokens_per_rank <= 16000
+                or type(expert_alignment) is not int or expert_alignment <= 0
+                or expert_alignment & (expert_alignment - 1)):
             raise ValueError("SDAA EPBuffer requires TP4-replicated EP16, H5120/K6/E384")
         if num_max_tokens_per_rank * ((hidden + 16) * 2 + num_topk * 8) + 4 > num_bytes // 4:
             raise ValueError("maximum sender rows exceed the native cross-buffer chunk")
@@ -69,6 +80,8 @@ class EPBuffer:
         self.device = torch.device("sdaa", torch.sdaa.current_device())
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.capacity = num_max_tokens_per_rank * 4
+        self.expert_alignment = expert_alignment
+        self.expanded_capacity = self.capacity * 6 + 24 * (expert_alignment - 1)
         self.runtime = _sdaa.Buffer(self.rank, 16, 4, 4, num_bytes, False)
         self.runtime.set_transport_token_capacity(num_max_tokens_per_rank)
         def gather(value):
@@ -83,26 +96,46 @@ class EPBuffer:
             raise RuntimeError("native SDAA transport initialization failed")
         self.routing_status = torch.zeros(4, dtype=torch.int64, device=self.device)
         self._source_rows = torch.arange(num_max_tokens_per_rank, dtype=torch.int16).to(self.device)
-
-    @staticmethod
-    def capture():
-        event = torch.sdaa.Event()
-        event.record(torch.sdaa.current_stream())
-        return event
+        # Fixed addresses are shared by eager and captured execution. Only native
+        # counts/slot metadata and valid rows are rewritten for each dispatch.
+        def zeros(shape, dtype):
+            return torch.zeros(shape, dtype=dtype, device=self.device)
+        self._ids = zeros((num_max_tokens_per_rank, 6), torch.int32)
+        self._wire_x = zeros((num_max_tokens_per_rank, 5136), torch.float16)
+        self._wire_x.view(torch.int16)[:, 5120].copy_(self._source_rows)
+        self._layout = zeros((num_max_tokens_per_rank + 1, 4), torch.int32)
+        self._send_counts = zeros(4, torch.int32)
+        self._card_counts = zeros(5, torch.int32)
+        self._card_ids = zeros((self.capacity, 6), torch.int32)
+        self._card_weights = zeros((self.capacity, 6), torch.float32)
+        self._card_x = zeros((self.capacity, 5136), torch.float16)
+        self._expanded_x = zeros((self.expanded_capacity, 5120), torch.float16)
+        self._expanded_weights = zeros(self.expanded_capacity, torch.float32)
+        self._rank_prefix = zeros(16, torch.int32)
+        self._expert_prefix = zeros(24, torch.int32)
+        self._expert_counts = zeros(24, torch.int32)
+        self._padded_counts = zeros(24, torch.int32)
+        self._route_slots = zeros((self.capacity, 6), torch.int32)
+        self._source = zeros((self.capacity, 2), torch.int32)
+        self._card_output = zeros((self.capacity, 5120), torch.float16)
+        self._output = zeros((num_max_tokens_per_rank, 5120), torch.float16)
+        self._pending = None
 
     def get_native_status(self):
         return self.runtime.get_epoch_status(), self.routing_status
 
     def dispatch(self, x, topk_idx, topk_weights, *, num_experts=384,
                  num_max_tokens_per_rank=None, expert_alignment=1,
-                 do_cpu_sync=False, do_expand=False, previous_event=None,
+                 do_cpu_sync=False, do_expand=True, previous_event=None,
                  async_with_compute_stream=False, allocate_on_comm_stream=False,
                  handle=None, defer_epilogue=False, **unsupported):
-        if (unsupported or do_cpu_sync or do_expand or expert_alignment != 1
+        if (unsupported or do_cpu_sync or not do_expand or expert_alignment != self.expert_alignment
                 or async_with_compute_stream or allocate_on_comm_stream
                 or defer_epilogue or handle is not None or num_experts != 384
                 or num_max_tokens_per_rank not in (None, self.num_max_tokens_per_rank)):
-            raise ValueError("unsupported SDAA dispatch mode; no CPU count sync or cached routing")
+            raise ValueError("SDAA dispatch requires expanded device-count routing with loaded alignment")
+        if self._pending is not None:
+            raise RuntimeError("combine the preceding EPHandle before reusing this buffer")
         if previous_event is not None:
             previous_event.current_stream_wait()
         n = x.shape[0]
@@ -114,62 +147,65 @@ class EPBuffer:
                 or not x.is_contiguous() or not topk_idx.is_contiguous()
                 or not topk_weights.is_contiguous()):
             raise ValueError("SDAA normalized FP16/FP32 route input differs from the loaded topology")
-        ids = torch.empty((n, 6), dtype=torch.int32, device=x.device)
+        ids = self._ids[:n]
         _sdaa.cast_indices(topk_idx, ids, self.routing_status, 384)
-        layout = torch.zeros((n + 1, 4), dtype=torch.int32, device=x.device)
-        send_counts = torch.empty(4, dtype=torch.int32, device=x.device)
-        wire_x = torch.zeros((n, 5136), dtype=torch.float16, device=x.device)
+        layout = self._layout[:n + 1]
+        send_counts = self._send_counts
+        wire_x = self._wire_x[:n]
         wire_x[:, :5120].copy_(x)
         # Opaque metadata bytes: original row, not a numeric FP16 conversion.
-        wire_x.view(torch.int16)[:, 5120].copy_(self._source_rows[:n])
         self.runtime.get_dispatch_layout(ids, topk_weights, wire_x, 96, 384, 4, 4, layout, send_counts)
         self.runtime.dispatch_data(ids, topk_weights, wire_x, 4, 4, send_counts)
-        card_counts = torch.empty(5, dtype=torch.int32, device=x.device)
-        card_ids = torch.full((self.capacity, 6), -1, dtype=torch.int32, device=x.device)
-        card_weights = torch.zeros((self.capacity, 6), dtype=torch.float32, device=x.device)
-        card_x = torch.zeros((self.capacity, 5136), dtype=torch.float16, device=x.device)
+        card_counts, card_ids = self._card_counts, self._card_ids
+        card_weights, card_x = self._card_weights, self._card_x
         self.runtime.gather_dispatch_data(self.dp_rank, 4, card_counts, card_ids, card_weights, card_x)
-        recv_ids = torch.full_like(card_ids, -1)
-        recv_weights = torch.zeros_like(card_weights)
-        recv_x = torch.zeros((self.capacity, 5120), dtype=x.dtype, device=x.device)
-        rank_prefix = torch.zeros(16, dtype=torch.int32, device=x.device)
-        expert_prefix = torch.zeros(24, dtype=torch.int32, device=x.device)
-        inverse = torch.full((self.capacity,), -1, dtype=torch.int32, device=x.device)
-        src = torch.full((self.capacity, 2), -1, dtype=torch.int32, device=x.device)
-        _sdaa.compact_dispatch(card_x, card_ids, card_weights, card_counts,
-            recv_x, recv_ids, recv_weights, rank_prefix, expert_prefix,
-            inverse, src, self.rank, self.routing_status)
+        recv_x, recv_weights = self._expanded_x, self._expanded_weights
+        rank_prefix, expert_prefix = self._rank_prefix, self._expert_prefix
+        inverse, src = self._route_slots, self._source
+        _sdaa.expand_dispatch(card_x, card_ids, card_weights, card_counts,
+            recv_x, recv_weights, rank_prefix, expert_prefix,
+            self._expert_counts, self._padded_counts, inverse, src,
+            self.rank, self.routing_status, expert_alignment)
         try:
             version = topk_idx._version
         except RuntimeError:
             version = None
         retained = (x, wire_x, ids, topk_weights, card_x, card_ids, card_weights, recv_x,
-                    recv_ids, recv_weights, rank_prefix, expert_prefix, inverse, src,
+                    recv_weights, rank_prefix, expert_prefix, inverse, src,
                     card_counts, layout, send_counts, self.routing_status)
         handle = EPHandle(self, topk_idx, version, num_experts,
-            self.num_max_tokens_per_rank, self.capacity, rank_prefix, expert_prefix,
-            src, inverse, card_counts, layout, send_counts, tuple(x.shape), retained)
-        return recv_x, recv_ids, recv_weights, handle, EventOverlap(self.capture(), retained)
+            self.num_max_tokens_per_rank, rank_prefix[-1], rank_prefix, expert_prefix,
+            src, inverse, card_counts, layout, send_counts, tuple(x.shape), retained,
+            self._expert_counts, self._padded_counts, expert_prefix[-1],
+            torch.sdaa.current_stream(),
+            expert_alignment=expert_alignment)
+        self._pending = handle
+        return recv_x, None, recv_weights, handle, EventOverlap(handle.stream, retained)
 
     def combine(self, x, handle, topk_weights=None, *, previous_event=None,
                 async_with_compute_stream=False, allocate_on_comm_stream=False,
                 defer_epilogue=False, **unsupported):
         handle.check(self)
+        if self._pending is not handle:
+            raise RuntimeError("EPHandle is no longer the active workspace owner")
+        if torch.sdaa.current_stream() != handle.stream:
+            raise ValueError("SDAA dispatch and combine must execute on the same stream")
         if (topk_weights is not None or unsupported or async_with_compute_stream
                 or allocate_on_comm_stream or defer_epilogue
-                or x.shape != (self.capacity, 5120) or x.dtype != torch.float16
+                or x.shape != (self.expanded_capacity, 5120) or x.dtype != torch.float16
                 or x.device != self.device or not x.is_contiguous()):
             raise ValueError("SDAA combine requires preweighted FP16 expert outputs and the original handle")
         if previous_event is not None:
             previous_event.current_stream_wait()
-        # Each SPA scatters only its expert contribution back to the card layout.
-        # The mature native card reduction sums these contributions exactly once.
-        card_output = torch.zeros_like(x)
-        _sdaa.scatter_combine(x, handle.dst_buffer_slot_idx, card_output, self.routing_status)
+        # The Ascend inverse-slot contract reduces local top-k slots once before
+        # the native card reduction/IPC combine. Coefficients are already applied.
+        card_output = self._card_output
+        _sdaa.combine_expanded(x, handle.dst_buffer_slot_idx, card_output, self.routing_status)
         self.runtime.get_combine_layout(card_output, handle.card_counts, 4, 4)
         self.runtime.combine_data(card_output, 4, 4, handle.card_counts)
-        output = torch.zeros(handle.original_shape, dtype=x.dtype, device=x.device)
+        output = self._output[:handle.original_shape[0]]
         self.runtime.gather_combine_data(self.dp_rank, 4, 4,
             handle.layout, handle.send_counts, output)
         retained = (handle, x, card_output, output)
-        return output, None, EventOverlap(self.capture(), retained)
+        self._pending = None
+        return output, None, EventOverlap(handle.stream, retained)
