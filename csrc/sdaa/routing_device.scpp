@@ -1,5 +1,9 @@
 #include <sdaa_runtime.h>
 #include <cstdint>
+#include <sdaa_atomic.h>
+#define DEEP_EP_LAYOUT_INLINE __device__ inline
+#include "include/expanded_layout.hpp"
+#undef DEEP_EP_LAYOUT_INLINE
 
 // SDAA backend of the DeepEP v2 deduplicated-rank layout and inverse slots.
 // Stable capacity outputs are padded; only device counts define valid rows.
@@ -94,6 +98,163 @@ __global__ void scatter_kernel(const void* input, const int* inverse, void* outp
                static_cast<unsigned long>(width) * 2);
     }
     libos_ldm_free(row);
+}
+
+namespace {
+__device__ inline void expanded_error(int64_t* status, int64_t code,
+                                     int64_t item, int64_t value, int64_t bound) {
+    if (sdaa::atomic_cas_bool(status, int64_t{0}, code)) {
+        status[1] = item;
+        status[2] = value;
+        status[3] = bound;
+    }
+}
+
+
+}
+
+__global__ void expand_dispatch_kernel(const void* hidden, const int* ids,
+    const float* weights, const int* counts, void* output, float* out_weights,
+    int* rank_prefix, int* expert_prefix, int* expert_counts, int* padded_counts,
+    int* route_slots, int* source, int capacity, int expanded_capacity,
+    int width, int rank, int alignment, int64_t* status) {
+    // PE0 creates the full fresh metadata through the same producer as focused.
+    if (threadIdx == 0)
+        deep_ep::sdaa_backend::build_expanded_layout(
+            static_cast<const uint16_t*>(hidden), ids, counts, rank_prefix,
+            expert_prefix, expert_counts, padded_counts, route_slots, source,
+            capacity, expanded_capacity, width, rank, alignment, status);
+    sdaa::sync_threads();
+    const bool metadata_failed = status[0] != 0;
+    // All SPEs decide whether to enter allocation before any can publish a failure.
+    sdaa::sync_threads();
+    if (metadata_failed) return;
+    const unsigned long row_bytes = static_cast<unsigned long>(width) * 2;
+    char* row_values = static_cast<char*>(libos_ldm_malloc(row_bytes, 0));
+    if (!row_values) expanded_error(status, 9, threadIdx, row_bytes, 0);
+    // All SPEs reach this barrier even if their own SPM allocation failed.
+    sdaa::sync_threads();
+    if (status[0] != 0) {
+        if (row_values) libos_ldm_free(row_values);
+        return;
+    }
+    for (int row = static_cast<int>(threadIdx); row < counts[4]; row += threadDim) {
+        if (source[row * 2] < 0) continue;
+        memcpy(row_values, static_cast<const char*>(hidden) +
+            static_cast<long>(row) * (width + 16) * 2, row_bytes);
+        for (int k = 0; k < 6; ++k) {
+            const int destination = route_slots[row * 6 + k];
+            if (destination < 0) continue;
+            if (destination >= expanded_capacity) {
+                expanded_error(status, 8, row * 6 + k, destination, expanded_capacity);
+                continue;
+            }
+            memcpy(static_cast<char*>(output) + static_cast<long>(destination) * row_bytes,
+                   row_values, row_bytes);
+            // Coefficients are opaque FP32 words at this transport boundary.
+            reinterpret_cast<uint32_t*>(out_weights)[destination] =
+                reinterpret_cast<const uint32_t*>(weights)[row * 6 + k];
+        }
+    }
+    // Refresh only current per-expert padding; unused capacity stays unconsumed.
+    memset(row_values, 0, row_bytes);
+    for (int expert = static_cast<int>(threadIdx); expert < 24; expert += threadDim) {
+        const int end = expert_prefix[expert];
+        const int padding = padded_counts[expert] - expert_counts[expert];
+        for (int row = end; row < end + padding; ++row) {
+            memcpy(static_cast<char*>(output) + static_cast<long>(row) * row_bytes,
+                   row_values, row_bytes);
+            out_weights[row] = 0.f;
+        }
+    }
+    libos_ldm_free(row_values);
+}
+
+__global__ void combine_expanded_kernel(const void* input, const int* route_slots,
+    void* output, int capacity, int expanded_capacity, int width, int64_t* status) {
+    const bool previously_failed = status[0] != 0;
+    sdaa::sync_threads();
+    if (previously_failed) return;
+    const unsigned long row_bytes = static_cast<unsigned long>(width) * 2;
+    auto* values = static_cast<_Float16*>(libos_ldm_malloc(row_bytes, 0));
+    auto* result = static_cast<_Float16*>(libos_ldm_malloc(row_bytes, 0));
+    auto* sums = static_cast<float*>(libos_ldm_malloc(static_cast<unsigned long>(width) * 4, 0));
+    if (!values || !result || !sums) expanded_error(status, 10, threadIdx, row_bytes * 4, 0);
+    sdaa::sync_threads();
+    if (status[0] != 0) {
+        if (values) libos_ldm_free(values);
+        if (result) libos_ldm_free(result);
+        if (sums) libos_ldm_free(sums);
+        return;
+    }
+    for (int row = static_cast<int>(threadIdx); row < capacity; row += threadDim) {
+        int slots[6], used = 0;
+        bool valid = true;
+        for (int k = 0; k < 6; ++k) {
+            const int slot = route_slots[row * 6 + k];
+            if (slot < -1 || slot >= expanded_capacity) {
+                expanded_error(status, 11, row * 6 + k, slot, expanded_capacity);
+                valid = false;
+            } else if (slot >= 0) slots[used++] = slot;
+        }
+        if (!valid || used == 0) {
+            memset(result, 0, row_bytes);
+        } else if (used == 1) {
+            // Fixed Ascend count-one path is a bit copy, preserving signed zero.
+            memcpy(result, static_cast<const char*>(input) +
+                   static_cast<long>(slots[0]) * row_bytes, row_bytes);
+        } else {
+            // Native moe_reduce / Ascend accumulate in original top-k order,
+            // then narrow once. The projections already applied coefficients.
+            for (int k = 0; k < used; ++k) {
+                memcpy(values, static_cast<const char*>(input) +
+                       static_cast<long>(slots[k]) * row_bytes, row_bytes);
+                for (int column = 0; column < width; column += 16) {
+                    float16v16 packed;
+                    simd_load(packed, values + column);
+                    const floatv16 widened = simd_vfcvths(packed);
+                    floatv16 accumulated = widened;
+                    if (k != 0) {
+                        floatv16 previous;
+                        simd_load(previous, sums + column);
+                        accumulated = simd_vfadds(previous, widened);
+                    }
+                    simd_store(accumulated, sums + column);
+                }
+            }
+            for (int column = 0; column < width; column += 16) {
+                floatv16 accumulated;
+                simd_load(accumulated, sums + column);
+                const float16v16 packed = simd_vfcvtsh(accumulated);
+                simd_store(packed, result + column);
+            }
+        }
+        // All card rows, including now-nonlocal rows, are refreshed each call.
+        memcpy(static_cast<char*>(output) + static_cast<long>(row) * row_bytes,
+               result, row_bytes);
+    }
+    libos_ldm_free(values);
+    libos_ldm_free(result);
+    libos_ldm_free(sums);
+}
+
+extern "C" sdaaError_t deep_ep_expand_dispatch(sdaaStream_t stream,
+    const void* hidden, const int* ids, const float* weights, const int* counts,
+    void* output, float* out_weights, int* rank_prefix, int* expert_prefix,
+    int* expert_counts, int* padded_counts, int* route_slots, int* source,
+    int capacity, int expanded_capacity, int width, int rank, int alignment,
+    int64_t* status) {
+    expand_dispatch_kernel<<<1, stream>>>(hidden, ids, weights, counts, output,
+        out_weights, rank_prefix, expert_prefix, expert_counts, padded_counts,
+        route_slots, source, capacity, expanded_capacity, width, rank, alignment, status);
+    return sdaaGetLastError();
+}
+extern "C" sdaaError_t deep_ep_combine_expanded(sdaaStream_t stream,
+    const void* input, const int* route_slots, void* output, int capacity,
+    int expanded_capacity, int width, int64_t* status) {
+    combine_expanded_kernel<<<1, stream>>>(input, route_slots, output, capacity,
+                                         expanded_capacity, width, status);
+    return sdaaGetLastError();
 }
 
 extern "C" sdaaError_t deep_ep_cast_indices(sdaaStream_t stream, const void* input,
