@@ -72,14 +72,14 @@ if(TORCH_SDAA_INCLUDE_DIR)
     target_compile_features(tecoep_torch_ops PUBLIC cxx_std_17)
     target_include_directories(tecoep_torch_ops PUBLIC include "${SDAA_INCLUDE_DIR}" "${TORCH_SDAA_INCLUDE_DIR}")
     target_link_libraries(tecoep_torch_ops PRIVATE ${TORCH_LIBRARIES})
-    find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
     find_path(IBVERBS_INCLUDE_DIR infiniband/verbs.h REQUIRED)
     add_library(tecoep_transport_host OBJECT config.cpp ib_tools.cpp ib_comm.cpp
         all2all.cpp buffer_lifecycle.cpp buffer_kernels.cpp buffer_communication.cpp bindings.cpp routing_bindings.cpp)
     target_compile_features(tecoep_transport_host PUBLIC cxx_std_17)
     target_include_directories(tecoep_transport_host PUBLIC include "${SDAA_INCLUDE_DIR}"
         "${TORCH_SDAA_INCLUDE_DIR}" "${IBVERBS_INCLUDE_DIR}")
-    target_link_libraries(tecoep_transport_host PRIVATE ${TORCH_LIBRARIES} Python3::Python)
+    target_link_libraries(tecoep_transport_host PRIVATE ${TORCH_LIBRARIES} Python3::Module)
 
     if(SDAA_COMPILER)
         get_filename_component(sdaa_root "${SDAA_INCLUDE_DIR}" DIRECTORY)

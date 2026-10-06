@@ -15,12 +15,16 @@ class NativeBuild(build_ext):
         import torch_sdaa
         sdk = Path(os.environ["SDAA_HOME"])
         backend = Path(torch_sdaa.__file__).resolve().parent
+        python_include = Path(sys.prefix) / "include" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        if not (python_include / "Python.h").is_file():
+            raise RuntimeError(f"Current Python installation has no development header: {python_include}")
         subprocess.check_call(["cmake", "-S", str(root / "csrc/sdaa"), "-B", str(target),
             "-DBUILD_TESTING=OFF", "-DCMAKE_BUILD_TYPE=Release",
             "-DSDAA_INCLUDE_DIR=" + str(sdk / "include"),
             "-DSDAA_COMPILER=" + str(sdk / "bin/tecocc"),
             "-DTORCH_SDAA_INCLUDE_DIR=" + str(backend / "include"),
             "-DPython3_EXECUTABLE=" + sys.executable,
+            "-DPython3_INCLUDE_DIR=" + str(python_include),
             "-DCMAKE_PREFIX_PATH=" + torch.utils.cmake_prefix_path,
             "-DCMAKE_INSTALL_PREFIX=" + str(Path(self.build_lib).resolve() / "deep_ep")])
         subprocess.check_call(["cmake", "--build", str(target), "--target", "_sdaa", "-j", os.environ.get("MAX_JOBS", "4")])
