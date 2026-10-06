@@ -1,0 +1,7 @@
+#pragma once
+#include <sdaa_runtime.h>
+#include <cstdint>
+extern "C" sdaaError_t deep_ep_cast_indices(sdaaStream_t, const void*, int, int*, int, int, int64_t*);
+extern "C" sdaaError_t deep_ep_compact(sdaaStream_t, const void*, const int*, const float*, const int*,
+ void*, int*, float*, int*, int*, int*, int*, int, int, int, int64_t*);
+extern "C" sdaaError_t deep_ep_scatter(sdaaStream_t, const void*, const int*, void*, int, int, int64_t*);

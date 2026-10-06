@@ -1,0 +1,35 @@
+#include <sdaa_runtime.h>
+#include <sdaa_atomic.h>
+#include <cstdint>
+
+namespace tecoep::kernels {
+__global__ void wait_receive_epoch_kernel(unsigned long* published,
+    unsigned long* expected, int dp_rank, int dp_size, int phase,
+    std::int64_t* status) {
+    if (RPEN() == 0 && status[0] == 0) {
+        for (int i = 0; i < dp_size; ++i) {
+            const int peer = (dp_rank + i) % dp_size;
+            const unsigned long target = ++expected[peer];
+            auto* stamp = reinterpret_cast<std::int64_t*>(published + peer);
+            volatile std::int64_t* read_stamp = stamp;
+            const unsigned long start = RTC();
+            std::int64_t observed;
+            bool acquired;
+            do {
+                observed = *read_stamp;
+                // Reuse the mature native stamp/CAS visibility pattern.
+                acquired = sdaa::atomic_cas_bool(stamp, observed, observed);
+                if (acquired && static_cast<unsigned long>(observed) == target) break;
+            } while (RTC() - start < 20000000000UL);
+            if (!acquired || static_cast<unsigned long>(observed) != target) {
+                status[1] = peer;
+                status[2] = static_cast<std::int64_t>(target);
+                status[3] = observed;
+                status[0] = phase;
+                break;
+            }
+        }
+    }
+    sdaa::sync_threads();
+}
+}

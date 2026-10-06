@@ -1,0 +1,358 @@
+#include <sdaa_runtime.h>
+#include <cstddef>
+
+// Recovered from g447683d with Ghidra 12.1.4 / SWAI e50d64ab.
+// Original device entries: FP16/FP16 0x8cdc (3604 bytes),
+// FP16/FP32 0x9af0 (3552 bytes). All three payloads are copied as bytes.
+namespace tecoep::kernels {
+namespace {
+
+__device__ inline int gather_add32(int a, int b) {
+    return static_cast<int>(static_cast<unsigned>(a) + static_cast<unsigned>(b));
+}
+
+__device__ inline int gather_sub32(int a, int b) {
+    return static_cast<int>(static_cast<unsigned>(a) - static_cast<unsigned>(b));
+}
+
+__device__ inline int gather_mul32(int a, int b) {
+    return static_cast<int>(static_cast<unsigned>(a) * static_cast<unsigned>(b));
+}
+
+__device__ inline int gather_divide32(int numerator, int denominator) {
+    return denominator == 0 ? 0 :
+        static_cast<int>(static_cast<long>(numerator) / denominator);
+}
+
+__device__ inline unsigned long gather_divide64(unsigned long numerator,
+                                               unsigned long denominator) {
+    return denominator == 0 ? 0 : numerator / denominator;
+}
+
+template<class Hidden, class Weight>
+__device__ inline void gather_get(int* indices, Weight* weights, Hidden* hidden,
+    char* index_input, char* weight_input, char* hidden_input, int begin,
+    int count, int topk, int hidden_size, sdaa::MemcpyHandle& handle) {
+    const long index_offset = static_cast<long>(gather_mul32(begin, topk));
+    const long hidden_offset = static_cast<long>(gather_mul32(begin, hidden_size));
+    const unsigned index_count = static_cast<unsigned>(gather_mul32(count, topk));
+    const unsigned hidden_count = static_cast<unsigned>(gather_mul32(count, hidden_size));
+    sdaa::memcpy_async(indices, index_input + index_offset * 4,
+        static_cast<unsigned>(index_count * 4), sdaa::MemcpyGlobalToSpm, handle);
+    sdaa::memcpy_async(weights, weight_input + index_offset * sizeof(Weight),
+        static_cast<unsigned>(index_count * sizeof(Weight)), sdaa::MemcpyGlobalToSpm, handle);
+    sdaa::memcpy_async(hidden, hidden_input + hidden_offset * sizeof(Hidden),
+        static_cast<unsigned>(hidden_count * sizeof(Hidden)), sdaa::MemcpyGlobalToSpm, handle);
+}
+
+template<class Hidden, class Weight>
+__device__ inline void gather_put(int* indices, Weight* weights, Hidden* hidden,
+    int* index_output, Weight* weight_output, Hidden* hidden_output, int begin,
+    int count, int topk, int hidden_size, sdaa::MemcpyHandle& handle) {
+    const long index_offset = static_cast<long>(gather_mul32(begin, topk));
+    const long hidden_offset = static_cast<long>(gather_mul32(begin, hidden_size));
+    const unsigned index_count = static_cast<unsigned>(gather_mul32(count, topk));
+    const unsigned hidden_count = static_cast<unsigned>(gather_mul32(count, hidden_size));
+    sdaa::memcpy_async(index_output + index_offset, indices,
+        static_cast<unsigned>(index_count * 4), sdaa::MemcpySpmToGlobal, handle);
+    sdaa::memcpy_async(weight_output + index_offset, weights,
+        static_cast<unsigned>(index_count * sizeof(Weight)), sdaa::MemcpySpmToGlobal, handle);
+    sdaa::memcpy_async(hidden_output + hidden_offset, hidden,
+        static_cast<unsigned>(hidden_count * sizeof(Hidden)), sdaa::MemcpySpmToGlobal, handle);
+}
+
+} // namespace
+
+template<class Hidden, class Weight>
+__global__ void gather_dispatch_data(char* send_buffer, char* recv_buffer,
+    unsigned long cross_buffer_size, int dp_rank, int dp_size, int topk,
+    int hidden_size, int* recv_num_tokens_per_dp, int* recv_topk_idx,
+    Weight* recv_topk_weight, Hidden* recv_hidden_states) {
+    // Kernel entry initializes the SDK allocation bitmap, as in the original.
+    const unsigned long bytes_per_dp = gather_divide64(cross_buffer_size,
+                                                      static_cast<unsigned long>(dp_size));
+    int* prefix = static_cast<int*>(libos_ldm_malloc(
+        static_cast<unsigned long>(gather_add32(dp_size, 1)) * 4, 0));
+    prefix[0] = 0;
+    for (int rank = 0; rank < dp_size; ++rank) {
+        char* source = rank == dp_rank ? send_buffer : recv_buffer;
+        const int count = *reinterpret_cast<int*>(source +
+                            static_cast<unsigned long>(rank) * bytes_per_dp);
+        prefix[rank + 1] = gather_add32(prefix[rank], count);
+    }
+
+    const unsigned long pe = RPEN();
+    if (pe == 0) recv_num_tokens_per_dp[dp_size] = prefix[dp_size];
+    sdaa::sync_threads();
+
+    const int group = gather_divide32(gather_add32(dp_size, 31), dp_size);
+    const unsigned long rank = gather_divide64(pe, static_cast<unsigned long>(group));
+    const int group_begin = gather_mul32(group, static_cast<int>(rank));
+    const int available = gather_sub32(32, group_begin);
+    const int group_size = group < available ? group : available;
+    if (static_cast<unsigned long>(group_begin) <= pe && group_size > 0 &&
+        pe < static_cast<unsigned long>(gather_add32(group_begin, group_size))) {
+        const int rank_count = gather_sub32(prefix[rank + 1], prefix[rank]);
+        if (pe == static_cast<unsigned long>(group_begin)) {
+            recv_num_tokens_per_dp[rank] = rank_count;
+        }
+        const int chunk = gather_divide32(
+            gather_add32(gather_add32(rank_count, group_size), -1), group_size);
+        const int begin = gather_mul32(chunk,
+            gather_sub32(static_cast<int>(pe), group_begin));
+        const int remaining = gather_sub32(rank_count, begin);
+        const int count = chunk < remaining ? chunk : remaining;
+        if (rank_count > 0 && count > 0) {
+            const int batch = count < 8 ? count : 8;
+            const int tail = gather_sub32(count,
+                gather_mul32(batch, gather_divide32(count, batch)));
+            const int full_count = gather_sub32(count, tail);
+            char* source = static_cast<int>(rank) == dp_rank ? send_buffer : recv_buffer;
+            char* index_input = source + rank * bytes_per_dp + 4;
+            const long rank_indices = static_cast<long>(gather_mul32(rank_count, topk));
+            char* weight_input = index_input + rank_indices * 4;
+            char* hidden_input = weight_input + rank_indices * sizeof(Weight);
+
+            // Four 48-byte SDK handles match the original local DMA groups.
+            // The two GET groups retain independent reply/counter words while
+            // the PUT group is waited before a buffer can be reused.
+            sdaa::MemcpyHandle get_first;
+            sdaa::MemcpyHandle get_second;
+            sdaa::MemcpyHandle put;
+            sdaa::MemcpyHandle remainder;
+            const unsigned long index_bytes = static_cast<unsigned long>(batch) * topk * 4;
+            const unsigned long weight_bytes = static_cast<unsigned long>(batch) * topk * sizeof(Weight);
+            const unsigned long hidden_bytes = static_cast<unsigned long>(batch) * hidden_size * sizeof(Hidden);
+            int* indices_first = static_cast<int*>(libos_ldm_malloc(index_bytes, 0));
+            Weight* weights_first = static_cast<Weight*>(libos_ldm_malloc(weight_bytes, 0));
+            Hidden* hidden_first = static_cast<Hidden*>(libos_ldm_malloc(hidden_bytes, 0));
+            int* indices_second = static_cast<int*>(libos_ldm_malloc(index_bytes, 0));
+            Weight* weights_second = static_cast<Weight*>(libos_ldm_malloc(weight_bytes, 0));
+            Hidden* hidden_second = static_cast<Hidden*>(libos_ldm_malloc(hidden_bytes, 0));
+
+            gather_get(indices_first, weights_first, hidden_first, index_input,
+                weight_input, hidden_input, begin, batch, topk, hidden_size, get_first);
+            sdaa::memcpy_wait(get_first);
+            bool first = true;
+            for (int offset = 0; offset < full_count; offset = gather_add32(offset, batch)) {
+                const int next = gather_add32(offset, batch);
+                int* indices = first ? indices_first : indices_second;
+                Weight* weights = first ? weights_first : weights_second;
+                Hidden* hidden = first ? hidden_first : hidden_second;
+                sdaa::MemcpyHandle& next_get = first ? get_second : get_first;
+                if (next < full_count) {
+                    gather_get(first ? indices_second : indices_first,
+                        first ? weights_second : weights_first,
+                        first ? hidden_second : hidden_first, index_input, weight_input,
+                        hidden_input, gather_add32(begin, next), batch, topk, hidden_size, next_get);
+                }
+                const int destination = gather_add32(gather_add32(begin, offset), prefix[rank]);
+                gather_put(indices, weights, hidden, recv_topk_idx, recv_topk_weight,
+                    recv_hidden_states, destination, batch, topk, hidden_size, put);
+                sdaa::memcpy_wait(put);
+                if (next < full_count) sdaa::memcpy_wait(next_get);
+                first = !first;
+            }
+            if (tail > 0) {
+                const int tail_begin = gather_add32(begin, full_count);
+                gather_get(indices_first, weights_first, hidden_first, index_input,
+                    weight_input, hidden_input, tail_begin, tail, topk, hidden_size, remainder);
+                sdaa::memcpy_wait(remainder);
+                gather_put(indices_first, weights_first, hidden_first, recv_topk_idx,
+                    recv_topk_weight, recv_hidden_states, gather_add32(tail_begin, prefix[rank]),
+                    tail, topk, hidden_size, remainder);
+                sdaa::memcpy_wait(remainder);
+            }
+            libos_ldm_free(indices_first);
+            libos_ldm_free(indices_second);
+            libos_ldm_free(weights_first);
+            libos_ldm_free(weights_second);
+            libos_ldm_free(hidden_first);
+            libos_ldm_free(hidden_second);
+        }
+    }
+    libos_ldm_free(prefix);
+}
+
+template __global__ void gather_dispatch_data<_Float16, _Float16>(char*, char*, unsigned long,
+    int, int, int, int, int*, int*, _Float16*, _Float16*);
+template __global__ void gather_dispatch_data<_Float16, float>(char*, char*, unsigned long,
+    int, int, int, int, int*, int*, float*, _Float16*);
+
+namespace {
+
+__device__ inline void gather_packet_get(void* destination, const void* source,
+                                       unsigned size, unsigned section) {
+    sdaa::memcpy_async(destination, source, size, section,
+        sdaa::MemoryStride{0, 32}, sdaa::MemcpyGlobalToSpm);
+}
+
+__device__ inline void gather_packet_put(void* destination, const void* source,
+                                       unsigned size) {
+    sdaa::memcpy_async(destination, source, size, sdaa::MemcpySpmToGlobal);
+}
+
+} // namespace
+
+// Original FP16/FP16 entry 0xa8d0 (4196 bytes), FP16/FP32 0xb934 (3976).
+// The final epoch pointer extends the host argument block to 80 bytes.
+template<class Hidden, class Weight>
+__global__ void gather_dispatch_data_lowlatency(char* send_buffer, char* recv_buffer,
+    unsigned long cross_buffer_size, int dp_rank, int dp_size, int topk,
+    int hidden_size, int* recv_num_tokens_per_dp, int* recv_topk_idx,
+    Weight* recv_topk_weight, Hidden* recv_hidden_states, unsigned long* barrier_flag) {
+    const unsigned long pe = RPEN();
+    if (pe == 0) {
+        for (int rank = 0; rank < dp_size; ++rank) ++barrier_flag[rank];
+    }
+    sdaa::sync_threads();
+    const unsigned long bytes_per_dp = gather_divide64(cross_buffer_size,
+                                                      static_cast<unsigned long>(dp_size));
+    const unsigned long prefix_bytes = static_cast<unsigned long>(gather_add32(dp_size, 1)) * 4;
+    int* token_prefix = static_cast<int*>(libos_ldm_malloc(prefix_bytes, 0));
+    int* packet_prefix = static_cast<int*>(libos_ldm_malloc(prefix_bytes, 0));
+    const unsigned long epoch_bytes = static_cast<unsigned long>(dp_size) * 8;
+    unsigned long* epochs = static_cast<unsigned long*>(libos_ldm_malloc(epoch_bytes, 0));
+    // Original 0x2590 is the SDK's blocking, direction-aware memcpy body.
+    memcpy(epochs, barrier_flag, epoch_bytes);
+    token_prefix[0] = 0;
+    packet_prefix[0] = 0;
+    for (int rank = 0; rank < dp_size; ++rank) {
+        char* source = (static_cast<unsigned long>(rank) == static_cast<unsigned>(dp_rank)
+            ? send_buffer : recv_buffer) + static_cast<unsigned long>(rank) * bytes_per_dp;
+        volatile unsigned long* stamp = reinterpret_cast<volatile unsigned long*>(source + 96);
+        while (*stamp != epochs[rank]) {}
+        int* header = reinterpret_cast<int*>(source);
+        token_prefix[rank + 1] = gather_add32(token_prefix[rank], header[1]);
+        packet_prefix[rank + 1] = gather_add32(packet_prefix[rank],
+                                             gather_divide32(header[0], 128));
+    }
+    if (pe == 0) recv_num_tokens_per_dp[dp_size] = token_prefix[dp_size];
+    sdaa::sync_threads();
+    (void)RTC();
+
+    const int group = gather_divide32(gather_add32(dp_size, 31), dp_size);
+    const unsigned long rank = gather_divide64(pe, static_cast<unsigned long>(group));
+    const int group_begin = gather_mul32(group, static_cast<int>(rank));
+    char* source = (static_cast<unsigned>(rank) == static_cast<unsigned>(dp_rank)
+        ? send_buffer : recv_buffer) + rank * bytes_per_dp;
+    // These prefix reads precede the lane guard in both original bodies.
+    const int rank_count = gather_sub32(token_prefix[rank + 1], token_prefix[rank]);
+    const int available = gather_sub32(32, group_begin);
+    const int group_size = group < available ? group : available;
+    const bool active = static_cast<unsigned long>(group_begin) <= pe && group_size > 0 &&
+        pe < static_cast<unsigned long>(gather_add32(group_size, group_begin));
+    if (active) {
+        const int rank_packets = gather_sub32(packet_prefix[rank + 1], packet_prefix[rank]);
+        if (pe == static_cast<unsigned long>(group_begin)) {
+            recv_num_tokens_per_dp[rank] = rank_count;
+        }
+        char* poll_buffer = static_cast<char*>(libos_ldm_malloc(4096, 0));
+        const int chunk = gather_divide32(
+            gather_add32(gather_add32(rank_packets, group_size), -1), group_size);
+        const int begin = gather_mul32(chunk,
+            gather_sub32(static_cast<int>(pe), group_begin));
+        const int remaining = gather_sub32(rank_packets, begin);
+        const int count = chunk < remaining ? chunk : remaining;
+        if (count > 0) {
+            const int end = gather_add32(begin, count);
+            for (long block = begin; block < end; block += 32) {
+                const int batch = block + 32 < end ? 32 : gather_sub32(end, static_cast<int>(block));
+                bool ready;
+                do {
+                    memcpy(poll_buffer, source + static_cast<long>(gather_mul32(static_cast<int>(block), 128)),
+                        static_cast<unsigned long>(static_cast<long>(gather_mul32(batch, 128))));
+                    ready = true;
+                    for (int slot = 0; slot < batch; ++slot) {
+                        volatile unsigned long* stamp = reinterpret_cast<volatile unsigned long*>(
+                            poll_buffer + static_cast<long>(slot) * 128 + 96);
+                        if (*stamp != epochs[rank]) {
+                            ready = false;
+                            break;
+                        }
+                    }
+                } while (!ready);
+            }
+        }
+        libos_ldm_free(poll_buffer);
+    }
+    sdaa::sync_threads();
+
+    if (active) {
+        const unsigned long rank_indices = static_cast<unsigned long>(rank_count) * topk;
+        const unsigned long index_bytes = rank_indices * 4;
+        const unsigned long weight_bytes = rank_indices * sizeof(Weight);
+        const int index_blocks = static_cast<int>(gather_divide64(index_bytes + 95, 96));
+        const int weight_blocks = static_cast<int>(gather_divide64(weight_bytes + 95, 96));
+        const int index_packet_bytes = gather_mul32(index_blocks, 128);
+        const int weight_packet_bytes = gather_mul32(weight_blocks, 128);
+        void* indices = libos_ldm_malloc(static_cast<unsigned long>(index_packet_bytes), 0);
+        void* weights = libos_ldm_malloc(static_cast<unsigned long>(weight_packet_bytes), 0);
+        char* index_input = source + 128;
+        char* weight_input = index_input + index_packet_bytes;
+        // With an incoming default counter B, original raw GETs wait for B+N
+        // and clear only reply; the following raw PUTs wait for N and clear
+        // both words. SDK GETs increment to B+N and wait/reset, then SDK PUTs
+        // increment to N and wait/reset. No counter read occurs between these
+        // phases, so DMA completion and final counter/reply state are identical.
+        // Reuse the fixed SDK default group (original reply/counter 0x4fc/0x4f8).
+        if (pe == static_cast<unsigned long>(group_begin) && rank_count > 0) {
+            gather_packet_get(indices, index_input, static_cast<unsigned>(index_bytes),
+                              static_cast<unsigned>(index_bytes < 96 ? index_bytes : 96));
+            gather_packet_get(weights, weight_input, static_cast<unsigned>(weight_bytes),
+                              static_cast<unsigned>(weight_bytes < 96 ? weight_bytes : 96));
+            sdaa::memcpy_wait();
+            const long output_position = static_cast<long>(gather_mul32(token_prefix[rank], topk));
+            gather_packet_put(recv_topk_idx + output_position, indices, static_cast<unsigned>(index_bytes));
+            gather_packet_put(recv_topk_weight + output_position, weights, static_cast<unsigned>(weight_bytes));
+            sdaa::memcpy_wait();
+        }
+
+        const unsigned long hidden_bytes = static_cast<unsigned long>(hidden_size) * sizeof(Hidden);
+        const unsigned long hidden_blocks = gather_divide64(hidden_bytes + 95, 96);
+        const int chunk = gather_divide32(
+            gather_add32(gather_add32(rank_count, group_size), -1), group_size);
+        const int begin = gather_mul32(chunk,
+            gather_sub32(static_cast<int>(pe), group_begin));
+        const int remaining = gather_sub32(rank_count, begin);
+        const int count = chunk < remaining ? chunk : remaining;
+        if (rank_count > 0 && count > 0) {
+            // Preserve all four original allocations and their bank flags,
+            // including the unused alternate and packet staging buffers.
+            void* hidden = libos_ldm_malloc(hidden_blocks * 96, 0);
+            void* hidden_other = libos_ldm_malloc(hidden_blocks * 96, 1);
+            void* packet = libos_ldm_malloc(hidden_blocks * 128, 0);
+            void* packet_other = libos_ldm_malloc(hidden_blocks * 128, 1);
+            char* hidden_input = weight_input + weight_packet_bytes;
+            const int hidden_packet_bytes = gather_mul32(static_cast<int>(hidden_blocks), 128);
+            const int end = gather_add32(begin, count);
+            for (long token = begin; token < end; ++token) {
+                gather_packet_get(hidden, hidden_input + static_cast<long>(gather_mul32(
+                    hidden_packet_bytes, static_cast<int>(token))), static_cast<unsigned>(hidden_bytes), 96);
+                sdaa::memcpy_wait();
+                const long output_position = static_cast<long>(gather_mul32(
+                    gather_add32(token_prefix[rank], static_cast<int>(token)), hidden_size));
+                gather_packet_put(recv_hidden_states + output_position, hidden,
+                                  static_cast<unsigned>(hidden_bytes));
+                sdaa::memcpy_wait();
+            }
+            libos_ldm_free(hidden);
+            libos_ldm_free(hidden_other);
+            libos_ldm_free(packet);
+            libos_ldm_free(packet_other);
+        }
+        libos_ldm_free(indices);
+        libos_ldm_free(weights);
+    }
+    libos_ldm_free(token_prefix);
+    libos_ldm_free(packet_prefix);
+    libos_ldm_free(epochs);
+    (void)RTC();
+}
+
+template __global__ void gather_dispatch_data_lowlatency<_Float16, _Float16>(char*, char*, unsigned long,
+    int, int, int, int, int*, int*, _Float16*, _Float16*, unsigned long*);
+template __global__ void gather_dispatch_data_lowlatency<_Float16, float>(char*, char*, unsigned long,
+    int, int, int, int, int*, int*, float*, _Float16*, unsigned long*);
+
+} // namespace tecoep::kernels

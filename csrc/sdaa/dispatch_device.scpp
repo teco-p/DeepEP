@@ -1,0 +1,352 @@
+#include <sdaa_runtime.h>
+#include <cstddef>
+#include <cstdint>
+#include <sdaa_atomic.h>
+#include "include/device_sync.hpp"
+
+// Recovered from g447683d SWAI instructions with the pinned LLVM decoder
+// and Ghidra SLEIGH. SDK DMA and synchronization remain SDK operations.
+namespace tecoep::kernels {
+namespace {
+
+__device__ inline int add32(int a, int b) {
+    return static_cast<int>(static_cast<unsigned>(a) + static_cast<unsigned>(b));
+}
+
+__device__ inline int mul32(int a, int b) {
+    return static_cast<int>(static_cast<unsigned>(a) * static_cast<unsigned>(b));
+}
+
+__device__ inline int sub32(int a, int b) {
+    return static_cast<int>(static_cast<unsigned>(a) - static_cast<unsigned>(b));
+}
+
+__device__ inline int divide32(int numerator, int denominator) {
+    // The original software division returns zero for zero divisors and
+    // preserves the low 32 bits for INT_MIN / -1.
+    return denominator == 0 ? 0 :
+        static_cast<int>(static_cast<long>(numerator) / denominator);
+}
+
+__device__ inline unsigned long divide64(unsigned long numerator,
+                                        unsigned long denominator) {
+    return denominator == 0 ? 0 : numerator / denominator;
+}
+
+} // namespace
+
+// Original device function 0x366c, 1452 bytes; 0x3674 is its local entry.
+__device__ void get_token_distributed(int num_tokens, int topk, int ep_size,
+    int local_expert_num, int* topk_idx, int* is_token_in_card,
+    int* num_tokens_per_card) {
+    const int pe = RPEN();
+    const int chunk = divide32(add32(num_tokens, 31), 32);
+    const int begin = mul32(chunk, pe);
+    const int remaining = sub32(num_tokens, begin);
+    const int count = remaining <= chunk ? remaining : chunk;
+    // The public wrapper allocates this prefix with empty(), including N=0.
+    // Initialize its base row even when no SPE enters the token work branch.
+    if (pe == 0) memset(is_token_in_card, 0, static_cast<unsigned long>(ep_size) * 4);
+    // Original DMA uses the SDK's fixed scoped-local default reply/counter
+    // (0x4fc/0x4f8), shared with the caller; no additional local handle.
+
+    if (count > 0) {
+        const unsigned long index_bytes = static_cast<unsigned long>(count) * 4 * topk;
+        int* indices = static_cast<int*>(libos_ldm_malloc(index_bytes, 0));
+        sdaa::memcpy_async(indices, topk_idx + mul32(begin, topk), index_bytes,
+                           sdaa::MemcpyGlobalToSpm);
+        const unsigned long flag_bytes = static_cast<unsigned long>(count) * 4 * ep_size;
+        int* flags = static_cast<int*>(libos_ldm_malloc(flag_bytes, 0));
+        memset(flags, 0, flag_bytes);
+        int* output = is_token_in_card + mul32(add32(begin, 1), ep_size);
+        memset(output, 0, flag_bytes);
+        sdaa::memcpy_wait();
+
+        for (int token = 0; token < count; ++token) {
+            for (int expert = 0; expert < topk; ++expert) {
+                const int card = divide32(indices[static_cast<long>(token) * topk + expert],
+                                          local_expert_num);
+                flags[static_cast<long>(token) * ep_size + card] = 1;
+            }
+        }
+        sdaa::memcpy_async(output, flags, flag_bytes,
+                           sdaa::MemcpySpmToGlobal);
+        sdaa::memcpy_wait();
+    }
+    sdaa::sync_threads();
+
+    if (static_cast<unsigned long>(pe) < static_cast<unsigned long>(ep_size)) {
+        const unsigned long bytes = static_cast<unsigned long>(add32(num_tokens, 1)) * 4;
+        int* prefix = static_cast<int*>(libos_ldm_malloc(bytes, 0));
+        const std::size_t skip = static_cast<std::size_t>(add32(mul32(ep_size, 4), -4));
+        sdaa::memcpy_async(prefix, is_token_in_card + pe, bytes, 4,
+                           sdaa::MemoryStride{0, skip}, sdaa::MemcpyGlobalToSpm);
+        sdaa::memcpy_wait();
+        for (int token = 0; token < num_tokens; ++token) {
+            prefix[token + 1] = add32(prefix[token + 1], prefix[token]);
+        }
+        sdaa::memcpy_async(is_token_in_card + pe, prefix, bytes, 4,
+                           sdaa::MemoryStride{skip, 0}, sdaa::MemcpySpmToGlobal);
+        num_tokens_per_card[pe] = prefix[num_tokens];
+        sdaa::memcpy_wait();
+    }
+    sdaa::sync_threads();
+}
+
+// Original FP16/FP16 entry 0xe788 (1912 bytes), FP16/FP32 0xef00 (1892).
+// The original copies weights and hidden states without numerical conversion.
+template<class Hidden, class Weight>
+__global__ void get_dispatch_layout(char* send_buffer, unsigned long cross_buffer_size,
+    int dp_size, int card_id_per_dp, int card_num_per_dp, int rank_id_local_card,
+    int ep_size, int num_tokens, int hidden_size, int topk, int local_expert_num,
+    int global_expert_num, int* topk_idx, Weight* topk_weight, Hidden* hidden_states,
+    int* is_token_in_card, int* num_tokens_per_card) {
+    (void)global_expert_num;
+    const unsigned long bytes_per_dp = divide64(cross_buffer_size,
+                                                static_cast<unsigned long>(dp_size));
+    get_token_distributed(num_tokens, topk, ep_size, local_expert_num,
+                          topk_idx, is_token_in_card, num_tokens_per_card);
+    // This early return is after the helper's two barriers and before the
+    // layout's final barrier, as in the original nonzero-local-rank branch.
+    if (rank_id_local_card != 0) return;
+
+    const long index_bytes = static_cast<long>(topk) * 4;
+    const long weight_bytes = static_cast<long>(topk) * sizeof(Weight);
+    const long hidden_bytes = static_cast<long>(hidden_size) * sizeof(Hidden);
+    int* indices = static_cast<int*>(libos_ldm_malloc(index_bytes, 0));
+    Weight* weights = static_cast<Weight*>(libos_ldm_malloc(weight_bytes, 0));
+    Hidden* hidden = static_cast<Hidden*>(libos_ldm_malloc(hidden_bytes, 0));
+    const int group = divide32(add32(dp_size, 31), dp_size);
+    const unsigned long pe = RPEN();
+    const unsigned long destination = divide64(pe, static_cast<unsigned long>(group));
+    const int group_begin = mul32(group, static_cast<int>(destination));
+    const int available = sub32(32, group_begin);
+    const int group_size = group < available ? group : available;
+
+    if (static_cast<unsigned long>(group_begin) <= pe && group_size > 0 &&
+        pe < static_cast<unsigned long>(add32(group_size, group_begin))) {
+        const int card = add32(mul32(static_cast<int>(destination), card_num_per_dp),
+                               card_id_per_dp);
+        const int total = num_tokens_per_card[card];
+        char* output = send_buffer + destination * bytes_per_dp;
+        if (pe == static_cast<unsigned long>(group_begin)) {
+            *reinterpret_cast<int*>(output) = total;
+        }
+        const int chunk = divide32(add32(add32(num_tokens, group_size), -1), group_size);
+        const int begin = mul32(chunk, sub32(static_cast<int>(pe), group_begin));
+        const int remaining = sub32(num_tokens, begin);
+        const int count = remaining < chunk ? remaining : chunk;
+        for (int offset = 0; offset < count; ++offset) {
+            const long token = static_cast<long>(begin) + offset;
+            const int next = is_token_in_card[(token + 1) * ep_size + card];
+            if (next == is_token_in_card[token * ep_size + card]) continue;
+            sdaa::memcpy_async(indices, topk_idx + token * topk, index_bytes,
+                               sdaa::MemcpyGlobalToSpm);
+            sdaa::memcpy_async(weights, topk_weight + token * topk, weight_bytes,
+                               sdaa::MemcpyGlobalToSpm);
+            sdaa::memcpy_async(hidden, hidden_states + token * hidden_size, hidden_bytes,
+                               sdaa::MemcpyGlobalToSpm);
+            sdaa::memcpy_wait();
+
+            const int position = add32(next, -1);
+            char* index_output = output + 4 + static_cast<long>(mul32(position, topk)) * 4;
+            char* weight_output = output + 4 + total * index_bytes +
+                                  static_cast<long>(mul32(position, topk)) * sizeof(Weight);
+            char* hidden_output = output + 4 + total * (index_bytes + weight_bytes) +
+                                  static_cast<long>(mul32(position, hidden_size)) * sizeof(Hidden);
+            sdaa::memcpy_async(index_output, indices, index_bytes,
+                               sdaa::MemcpySpmToGlobal);
+            sdaa::memcpy_async(weight_output, weights, weight_bytes,
+                               sdaa::MemcpySpmToGlobal);
+            sdaa::memcpy_async(hidden_output, hidden, hidden_bytes,
+                               sdaa::MemcpySpmToGlobal);
+            sdaa::memcpy_wait();
+        }
+    }
+    sdaa::sync_threads();
+}
+
+template __global__ void get_dispatch_layout<_Float16, _Float16>(char*, unsigned long,
+    int, int, int, int, int, int, int, int, int, int, int*, _Float16*, _Float16*, int*, int*);
+template __global__ void get_dispatch_layout<_Float16, float>(char*, unsigned long,
+    int, int, int, int, int, int, int, int, int, int, int*, float*, _Float16*, int*, int*);
+
+namespace {
+
+__device__ inline int packet_offset(unsigned long byte_position) {
+    const unsigned long block = divide64(byte_position, 96);
+    return static_cast<int>((block << 7) | (byte_position - block * 96));
+}
+
+__device__ inline void pack_hidden(char* packet, char* hidden, int blocks,
+                                    const unsigned long* stamp) {
+    // VFLDH/VFSTH have the SDK's logical float16v16 type (32 bytes).
+    // The original copies the rounded payload, including its unwritten tail.
+    for (int block = 0; block < blocks; ++block) {
+        float16v16 first, second, third;
+        simd_load(first, reinterpret_cast<_Float16*>(hidden));
+        simd_load(second, reinterpret_cast<_Float16*>(hidden + 32));
+        simd_load(third, reinterpret_cast<_Float16*>(hidden + 64));
+        simd_store(first, reinterpret_cast<_Float16*>(packet));
+        simd_store(second, reinterpret_cast<_Float16*>(packet + 32));
+        simd_store(third, reinterpret_cast<_Float16*>(packet + 64));
+        *reinterpret_cast<unsigned long*>(packet + 96) = *stamp;
+        hidden += 96;
+        packet += 128;
+    }
+}
+
+} // namespace
+
+// Original FP16/FP16 entry 0xf664 (3816 bytes), FP16/FP32 0x1054c (3404).
+// The final pointer extends the ordinary packed argument block to 104 bytes.
+template<class Hidden, class Weight>
+__global__ void get_dispatch_layout_lowlatency(char* send_buffer,
+    unsigned long cross_buffer_size, int dp_size, int card_id_per_dp,
+    int card_num_per_dp, int rank_id_local_card, int ep_size, int num_tokens,
+    int hidden_size, int topk, int local_expert_num, int global_expert_num,
+    int* topk_idx, Weight* topk_weight, Hidden* hidden_states,
+    int* is_token_in_card, int* num_tokens_per_card, unsigned long* barrier_flag) {
+    (void)global_expert_num;
+    const unsigned long bytes_per_dp = divide64(cross_buffer_size,
+                                                static_cast<unsigned long>(dp_size));
+    get_token_distributed(num_tokens, topk, ep_size, local_expert_num,
+                          topk_idx, is_token_in_card, num_tokens_per_card);
+    if (rank_id_local_card != 0) return;
+
+    const unsigned long pe = RPEN();
+    if (pe == 0) {
+        for (int rank = 0; rank < dp_size; ++rank) ++barrier_flag[rank];
+    }
+    sdaa::sync_threads();
+
+    const unsigned long index_bytes = static_cast<long>(topk) * 4UL;
+    const unsigned long weight_bytes = static_cast<long>(topk) * sizeof(Weight);
+    int* indices = static_cast<int*>(libos_ldm_malloc(index_bytes, 0));
+    unsigned long* stamp = static_cast<unsigned long*>(libos_ldm_malloc(32, 0));
+    Weight* weights = static_cast<Weight*>(libos_ldm_malloc(weight_bytes, 0));
+    const unsigned long hidden_bytes = static_cast<long>(hidden_size) * sizeof(Hidden);
+    const unsigned long rounded_blocks = divide64(hidden_bytes + 95, 96);
+    char* raw[2] = {
+        static_cast<char*>(libos_ldm_malloc(rounded_blocks * 96, 0)),
+        static_cast<char*>(libos_ldm_malloc(rounded_blocks * 96, 1))};
+    char* packet[2] = {
+        static_cast<char*>(libos_ldm_malloc(rounded_blocks * 128, 0)),
+        static_cast<char*>(libos_ldm_malloc(rounded_blocks * 128, 1))};
+    const int hidden_blocks = static_cast<int>(rounded_blocks);
+    const int packet_bytes = mul32(hidden_blocks, 128);
+    const int group = divide32(add32(dp_size, 31), dp_size);
+    const unsigned long destination = divide64(pe, static_cast<unsigned long>(group));
+    const int group_begin = mul32(group, static_cast<int>(destination));
+    const int available = sub32(32, group_begin);
+    const int group_size = group < available ? group : available;
+    (void)RTC();
+    // Inactive lanes also read their destination stamp before the group guard.
+    *stamp = barrier_flag[destination];
+
+    if (static_cast<unsigned long>(group_begin) <= pe && group_size > 0 &&
+        pe < static_cast<unsigned long>(add32(group_size, group_begin))) {
+        const int card = add32(mul32(static_cast<int>(destination), card_num_per_dp),
+                               card_id_per_dp);
+        const int total = num_tokens_per_card[card];
+        const int index_blocks = static_cast<int>(divide64(index_bytes *
+                                      static_cast<long>(total) + 95, 96));
+        const int weight_blocks = static_cast<int>(divide64(weight_bytes *
+                                      static_cast<long>(total) + 95, 96));
+        char* output = send_buffer + destination * bytes_per_dp;
+        const int index_packet_bytes = mul32(index_blocks, 128);
+        const int weight_packet_bytes = mul32(weight_blocks, 128);
+        if (pe == static_cast<unsigned long>(group_begin)) {
+            // The two original specializations order these stores differently.
+            if constexpr (sizeof(Weight) == 2) {
+                reinterpret_cast<int*>(output)[1] = total;
+                *reinterpret_cast<unsigned long*>(output + 96) = *stamp;
+            } else {
+                *reinterpret_cast<unsigned long*>(output + 96) = *stamp;
+                reinterpret_cast<int*>(output)[1] = total;
+            }
+            *reinterpret_cast<int*>(output) = add32(mul32(add32(
+                add32(mul32(total, hidden_blocks), weight_blocks), index_blocks), 128), 128);
+            for (int block = 0; block < index_blocks; ++block) {
+                *reinterpret_cast<unsigned long*>(output + 224 +
+                                                  static_cast<long>(block) * 128) = *stamp;
+            }
+            for (int block = 0; block < weight_blocks; ++block) {
+                *reinterpret_cast<unsigned long*>(output + index_packet_bytes + 224 +
+                                                  static_cast<long>(block) * 128) = *stamp;
+            }
+        }
+
+        char* index_output = output + 128;
+        char* weight_output = output + index_packet_bytes + 128;
+        char* hidden_output = output + index_packet_bytes + weight_packet_bytes + 128;
+        const int chunk = divide32(add32(add32(num_tokens, group_size), -1), group_size);
+        const int begin = mul32(chunk, sub32(static_cast<int>(pe), group_begin));
+        const int remaining = sub32(num_tokens, begin);
+        const int count = remaining < chunk ? remaining : chunk;
+        unsigned bank = 0;
+        char* previous_destination = nullptr;
+        for (int offset = 0; offset < count; ++offset) {
+            const long token = static_cast<long>(begin) + offset;
+            const int next = is_token_in_card[(token + 1) * ep_size + card];
+            if (next == is_token_in_card[token * ep_size + card]) continue;
+            const int position = add32(next, -1);
+            const long topk_position = mul32(position, topk);
+            sdaa::memcpy_async(indices, topk_idx + token * topk, index_bytes,
+                               sdaa::MemcpyGlobalToSpm);
+            sdaa::memcpy_async(weights, topk_weight + token * topk, weight_bytes,
+                               sdaa::MemcpyGlobalToSpm);
+            // Also drains the previous iteration's outstanding hidden PUT.
+            sdaa::memcpy_wait();
+            sdaa::memcpy_async(index_output + packet_offset(topk_position * 4UL),
+                               indices, index_bytes, sdaa::MemcpySpmToGlobal);
+            sdaa::memcpy_async(weight_output + packet_offset(topk_position * sizeof(Weight)),
+                               weights, weight_bytes, sdaa::MemcpySpmToGlobal);
+            sdaa::memcpy_wait();
+            sdaa::memcpy_async(raw[bank], hidden_states + token * hidden_size,
+                               hidden_bytes, sdaa::MemcpyGlobalToSpm);
+            bank = 1 - bank;
+            if (previous_destination == nullptr) {
+                sdaa::memcpy_wait();
+            } else {
+                pack_hidden(packet[bank], raw[bank], hidden_blocks, stamp);
+                sdaa::memcpy_wait();
+                sdaa::memcpy_async(previous_destination, packet[bank],
+                                   static_cast<unsigned long>(packet_bytes),
+                                   sdaa::MemcpySpmToGlobal);
+            }
+            previous_destination = hidden_output + mul32(packet_bytes, position);
+        }
+        if (previous_destination != nullptr) {
+            const unsigned last = 1 - bank;
+            pack_hidden(packet[last], raw[last], hidden_blocks, stamp);
+            sdaa::memcpy_wait();
+            sdaa::memcpy_async(previous_destination, packet[last],
+                               static_cast<unsigned long>(packet_bytes),
+                               sdaa::MemcpySpmToGlobal);
+            sdaa::memcpy_wait();
+        }
+    }
+    (void)RTC();
+    sdaa::sync_threads();
+    libos_ldm_free(indices);
+    libos_ldm_free(weights);
+    libos_ldm_free(raw[0]);
+    libos_ldm_free(raw[1]);
+    libos_ldm_free(packet[0]);
+    libos_ldm_free(packet[1]);
+    // The original does not free its 32-byte stamp allocation.
+}
+
+template __global__ void get_dispatch_layout_lowlatency<_Float16, _Float16>(char*, unsigned long,
+    int, int, int, int, int, int, int, int, int, int, int*, _Float16*, _Float16*, int*, int*, unsigned long*);
+template __global__ void get_dispatch_layout_lowlatency<_Float16, float>(char*, unsigned long,
+    int, int, int, int, int, int, int, int, int, int, int*, float*, _Float16*, int*, int*, unsigned long*);
+
+// Original device helper 0x33f0, 240 bytes. CASL's vector word1 is compare,
+// word2 is new; fixed LLVM lowerINTRINSIC_W_CHAIN confirms that ordering.
+__device__ void tcclDeviceSyncCardKernel(long* flag, int participants) {
+    sync_card(flag, participants);
+}
+
+} // namespace tecoep::kernels
