@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 
@@ -19,6 +20,7 @@ class NativeBuild(build_ext):
             "-DSDAA_INCLUDE_DIR=" + str(sdk / "include"),
             "-DSDAA_COMPILER=" + str(sdk / "bin/tecocc"),
             "-DTORCH_SDAA_INCLUDE_DIR=" + str(backend / "include"),
+            "-DPython3_EXECUTABLE=" + sys.executable,
             "-DCMAKE_PREFIX_PATH=" + torch.utils.cmake_prefix_path,
             "-DCMAKE_INSTALL_PREFIX=" + str(Path(self.build_lib).resolve() / "deep_ep")])
         subprocess.check_call(["cmake", "--build", str(target), "--target", "_sdaa", "-j", os.environ.get("MAX_JOBS", "4")])
