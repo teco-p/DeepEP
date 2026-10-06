@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import sysconfig
 from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 
@@ -15,8 +16,8 @@ class NativeBuild(build_ext):
         import torch_sdaa
         sdk = Path(os.environ["SDAA_HOME"])
         backend = Path(torch_sdaa.__file__).resolve().parent
-        python_include = Path(sys.prefix) / "include" / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        if not (python_include / "Python.h").is_file():
+        python_include = Path(sysconfig.get_path("include"))
+        if not all((python_include / name).is_file() for name in ("Python.h", "pyconfig.h")):
             raise RuntimeError(f"Current Python installation has no development header: {python_include}")
         subprocess.check_call(["cmake", "-S", str(root / "csrc/sdaa"), "-B", str(target),
             "-DBUILD_TESTING=OFF", "-DCMAKE_BUILD_TYPE=Release",
