@@ -25,8 +25,7 @@ void Buffer::get_dispatch_layout(const at::Tensor& topk_idx, const at::Tensor& t
         + (topk_idx.element_size() + topk_weight.element_size()) * topk;
     const std::size_t chunk = cross_buffer_size / static_cast<std::size_t>(this->dp_size);
     if (token_bytes == 0 || chunk < 4 || num_tokens < 0 ||
-        dispatch_token_bound_ < num_tokens ||
-        static_cast<std::size_t>(dispatch_token_bound_) > (chunk - 4) / token_bytes)
+        static_cast<std::size_t>(num_tokens) > (chunk - 4) / token_bytes)
         throw EPException("dispatch shape bound exceeds transport chunk", original_file, 563);
     const auto stream = torch::sdaa::getCurrentSDAAStream(-1);
     void* send = dispatch.send_buffer_ptrs[device_info.card_id_local_node];
