@@ -11,7 +11,6 @@ PYBIND11_MODULE(_sdaa, m) {
     bind_sdaa_routing(m);
     pybind11::class_<Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int, int, std::size_t, bool>())
-        .def("set_transport_token_capacity", &Buffer::set_transport_token_capacity)
         .def("get_epoch_status", &Buffer::get_epoch_status)
         .def("get_num_nodes", &Buffer::get_num_nodes)
         .def("is_available", &Buffer::is_available)

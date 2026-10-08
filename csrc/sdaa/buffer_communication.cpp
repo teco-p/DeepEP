@@ -20,7 +20,8 @@ void count_check(bool condition, const char* reason, int line) {
 // Main ELF 0x1b610. Original low-latency branch is a tail call, not the
 // spurious series of GOT calls shown by the decompiler at that branch.
 void Buffer::dispatch_data(const at::Tensor& topk_idx, const at::Tensor& topk_weight,
-    const at::Tensor& hidden_states, int ep_size_, int dp_size_, const at::Tensor& num_tokens_per_card) {
+    const at::Tensor& hidden_states, int ep_size_, int dp_size_, const at::Tensor& num_tokens_per_card,
+    std::int64_t transport_token_bound) {
     if (low_latency_mode) {
         dispatch_data_lowlatency(topk_idx, topk_weight, hidden_states, ep_size_, dp_size_, num_tokens_per_card);
         return;
@@ -28,14 +29,14 @@ void Buffer::dispatch_data(const at::Tensor& topk_idx, const at::Tensor& topk_we
     count_check(ep_size_ == num_tokens_per_card.size(0),
         "ep_size == num_tokens_per_card.size(0)failed, num_tokens_per_card.size(0) != ep_size", 674);
     count_check(dp_size_ == dp_size && dp_size_ > 0, "dispatch DP size differs from Buffer", 674);
-    count_check(dispatch_token_bound_ >= hidden_states.size(0),
-        "configure uniform transport capacity before dispatch", 674);
+    count_check(transport_token_bound >= hidden_states.size(0),
+        "transport bound must cover this source's rows", 674);
     const std::size_t token_bytes_bound = hidden_states.element_size() * hidden_states.size(1)
         + (topk_idx.element_size() + topk_weight.element_size()) * topk_idx.size(1);
     const std::size_t chunk_bound = cross_buffer_size / static_cast<std::size_t>(dp_size_);
-    count_check(token_bytes_bound > 0 && chunk_bound >= 4 && static_cast<std::size_t>(dispatch_token_bound_) <=
+    count_check(token_bytes_bound > 0 && chunk_bound >= 4 && static_cast<std::size_t>(transport_token_bound) <=
         (chunk_bound - 4) / token_bytes_bound, "dispatch shape bound exceeds transport chunk", 674);
-    const std::size_t copy_bytes = static_cast<std::size_t>(dispatch_token_bound_) * token_bytes_bound + 4;
+    const std::size_t copy_bytes = static_cast<std::size_t>(transport_token_bound) * token_bytes_bound + 4;
     auto stream = torch::sdaa::getCurrentSDAAStream(-1);
     const int card = device_info.card_id_local_node;
     if (device_info.rank_id_local_card == 0) {
@@ -92,20 +93,20 @@ void Buffer::dispatch_data(const at::Tensor& topk_idx, const at::Tensor& topk_we
 
 // Main ELF 0x1bdc8. Receive waits belong to gather_combine_data, not this call.
 void Buffer::combine_data(const at::Tensor& hidden_states, int ep_size_, int dp_size_,
-    const at::Tensor& recv_num_tokens_per_dp) {
+    const at::Tensor& recv_num_tokens_per_dp, std::int64_t transport_token_bound) {
     if (low_latency_mode) {
         combine_data_lowlatency(hidden_states, ep_size_, dp_size_, recv_num_tokens_per_dp);
         return;
     }
     count_check(dp_size_ + 1 == recv_num_tokens_per_dp.size(0),
         "dp_size + 1 == recv_num_tokens_per_dp.size(0)failed, recv_num_tokens_per_dp.size(0) != dp_size", 1025);
-    count_check(dp_size_ == dp_size && dp_size_ > 0 && dispatch_token_bound_ >= 0,
+    count_check(dp_size_ == dp_size && dp_size_ > 0 && transport_token_bound >= 0,
         "combine requires matching preceding dispatch", 1025);
     const std::size_t row_bytes = hidden_states.element_size() * hidden_states.size(1);
     const std::size_t chunk_bound = cross_buffer_size / static_cast<std::size_t>(dp_size_);
-    count_check(row_bytes > 0 && chunk_bound >= 4 && static_cast<std::size_t>(dispatch_token_bound_) <=
+    count_check(row_bytes > 0 && chunk_bound >= 4 && static_cast<std::size_t>(transport_token_bound) <=
         (chunk_bound - 4) / row_bytes, "combine shape bound exceeds transport chunk", 1025);
-    const std::size_t copy_bytes = static_cast<std::size_t>(dispatch_token_bound_) * row_bytes + 4;
+    const std::size_t copy_bytes = static_cast<std::size_t>(transport_token_bound) * row_bytes + 4;
     auto stream = torch::sdaa::getCurrentSDAAStream(-1);
     if (device_info.rank_id_local_card != 0) return;
     const int card = device_info.card_id_local_node;

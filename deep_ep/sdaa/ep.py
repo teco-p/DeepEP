@@ -51,6 +51,7 @@ class EPHandle:
     num_padded_recv_tokens_per_expert: torch.Tensor
     num_expanded_tokens: torch.Tensor
     stream: object
+    transport_token_bound: int
     do_expand: bool = True
     expert_alignment: int = 1
     num_recv_tokens_per_expert_list: object = None
@@ -87,7 +88,6 @@ class EPBuffer:
         self.expert_alignment = expert_alignment
         self.expanded_capacity = self.capacity * 6 + self.local_experts * (expert_alignment - 1)
         self.runtime = _sdaa.Buffer(self.rank, world_size, self.dp_size, self.dp_size, num_bytes, False)
-        self.runtime.set_transport_token_capacity(num_max_tokens_per_rank)
         def gather(value):
             result = [None] * world_size
             dist.all_gather_object(result, value, group)
@@ -128,7 +128,7 @@ class EPBuffer:
     def get_native_status(self):
         return self.runtime.get_epoch_status(), self.routing_status
 
-    def dispatch(self, x, topk_idx, topk_weights, *, num_experts=384,
+    def dispatch(self, x, topk_idx, topk_weights, *, transport_token_bound, num_experts=384,
                  num_max_tokens_per_rank=None, expert_alignment=1,
                  do_cpu_sync=False, do_expand=True, previous_event=None,
                  async_with_compute_stream=False, allocate_on_comm_stream=False,
@@ -143,6 +143,9 @@ class EPBuffer:
         if previous_event is not None:
             previous_event.current_stream_wait()
         n = x.shape[0]
+        if (type(transport_token_bound) is not int
+                or not n <= transport_token_bound <= self.num_max_tokens_per_rank):
+            raise ValueError("transport bound must cover all DP descriptors within the allocated capacity")
         if (x.shape != (n, 5120) or x.dtype != torch.float16
                 or x.device != self.device or n > self.num_max_tokens_per_rank
                 or topk_idx.shape != (n, 6) or topk_idx.dtype not in (torch.int32, torch.int64)
@@ -160,7 +163,8 @@ class EPBuffer:
         # Opaque metadata bytes: original row, not a numeric FP16 conversion.
         self.runtime.get_dispatch_layout(ids, topk_weights, wire_x, self.local_experts * 4,
                                          384, self.dp_size, self.dp_size, layout, send_counts)
-        self.runtime.dispatch_data(ids, topk_weights, wire_x, self.dp_size, self.dp_size, send_counts)
+        self.runtime.dispatch_data(ids, topk_weights, wire_x, self.dp_size, self.dp_size,
+                                   send_counts, transport_token_bound)
         card_counts, card_ids = self._card_counts, self._card_ids
         card_weights, card_x = self._card_weights, self._card_x
         self.runtime.gather_dispatch_data(self.dp_rank, self.dp_size, card_counts, card_ids, card_weights, card_x)
@@ -182,7 +186,7 @@ class EPBuffer:
             self.num_max_tokens_per_rank, rank_prefix[-1], rank_prefix, expert_prefix,
             src, inverse, card_counts, layout, send_counts, tuple(x.shape), retained,
             self._expert_counts, self._padded_counts, expert_prefix[-1],
-            torch.sdaa.current_stream(),
+            torch.sdaa.current_stream(), transport_token_bound,
             expert_alignment=expert_alignment)
         self._pending = handle
         return recv_x, None, recv_weights, handle, EventOverlap(handle.stream, retained)
@@ -207,7 +211,8 @@ class EPBuffer:
         card_output = self._card_output
         _sdaa.combine_expanded(x, handle.dst_buffer_slot_idx, card_output, self.routing_status)
         self.runtime.get_combine_layout(card_output, handle.card_counts, self.dp_size, self.dp_size)
-        self.runtime.combine_data(card_output, self.dp_size, self.dp_size, handle.card_counts)
+        self.runtime.combine_data(card_output, self.dp_size, self.dp_size, handle.card_counts,
+                                  handle.transport_token_bound)
         output = self._output[:handle.original_shape[0]]
         self.runtime.gather_combine_data(self.dp_rank, self.dp_size, self.dp_size,
             handle.layout, handle.send_counts, output)

@@ -21,18 +21,11 @@ private:
     at::Tensor dispatch_expected_epoch_;
     at::Tensor combine_expected_epoch_;
     at::Tensor epoch_status_;
-    std::int64_t dispatch_token_bound_ = -1;
 public:
     Buffer(int rank, int num_ranks, int dp_size, int ep_size, std::size_t cross_buffer_size, bool low_latency_mode);
     ~Buffer();
     int get_num_nodes() const;
     bool is_available() const;
-    // All DP sources must configure the same capacity before any capture/call.
-    void set_transport_token_capacity(std::int64_t capacity) {
-        TORCH_CHECK(capacity >= 0 && (dispatch_token_bound_ < 0 || dispatch_token_bound_ == capacity),
-            "transport token capacity must be nonnegative and immutable");
-        dispatch_token_bound_ = capacity;
-    }
     const at::Tensor& get_epoch_status() const { return epoch_status_; }
     pybind11::tuple get_dispatch_ipc_handle() const;
     pybind11::tuple get_combine_ipc_handle() const;
@@ -55,8 +48,10 @@ public:
     void gather_combine_data(long dp_rank, long dp_size, long ep_size,
         const at::Tensor& is_token_in_card, const at::Tensor& num_tokens_per_card, at::Tensor& out_hidden_states);
     void dispatch_data(const at::Tensor& topk_idx, const at::Tensor& topk_weight,
-        const at::Tensor& hidden_states, int ep_size, int dp_size, const at::Tensor& num_tokens_per_card);
-    void combine_data(const at::Tensor& hidden_states, int ep_size, int dp_size, const at::Tensor& recv_num_tokens_per_dp);
+        const at::Tensor& hidden_states, int ep_size, int dp_size, const at::Tensor& num_tokens_per_card,
+        std::int64_t transport_token_bound);
+    void combine_data(const at::Tensor& hidden_states, int ep_size, int dp_size,
+        const at::Tensor& recv_num_tokens_per_dp, std::int64_t transport_token_bound);
     void dispatch_data_lowlatency(const at::Tensor& topk_idx, const at::Tensor& topk_weight,
         const at::Tensor& hidden_states, int ep_size, int dp_size, const at::Tensor& num_tokens_per_card);
     void combine_data_lowlatency(const at::Tensor& hidden_states, int ep_size, int dp_size, const at::Tensor& recv_num_tokens_per_dp);
