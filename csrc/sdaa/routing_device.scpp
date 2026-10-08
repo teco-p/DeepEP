@@ -37,13 +37,13 @@ __global__ void expand_dispatch_kernel(const void* hidden, const int* ids,
     const float* weights, const int* counts, void* output, float* out_weights,
     int* rank_prefix, int* expert_prefix, int* expert_counts, int* padded_counts,
     int* route_slots, int* source, int capacity, int expanded_capacity,
-    int width, int rank, int alignment, int64_t* status) {
+    int width, int rank, int dp_size, int alignment, int64_t* status) {
     // PE0 creates the full fresh metadata through the same producer as focused.
     if (threadIdx == 0)
         deep_ep::sdaa_backend::build_expanded_layout(
             static_cast<const uint16_t*>(hidden), ids, counts, rank_prefix,
             expert_prefix, expert_counts, padded_counts, route_slots, source,
-            capacity, expanded_capacity, width, rank, alignment, status);
+            capacity, expanded_capacity, width, rank, dp_size, alignment, status);
     sdaa::sync_threads();
     const bool metadata_failed = status[0] != 0;
     // All SPEs decide whether to enter allocation before any can publish a failure.
@@ -58,7 +58,7 @@ __global__ void expand_dispatch_kernel(const void* hidden, const int* ids,
         if (row_values) libos_ldm_free(row_values);
         return;
     }
-    for (int row = static_cast<int>(threadIdx); row < counts[4]; row += threadDim) {
+    for (int row = static_cast<int>(threadIdx); row < counts[dp_size]; row += threadDim) {
         if (source[row * 2] < 0) continue;
         memcpy(row_values, static_cast<const char*>(hidden) +
             static_cast<long>(row) * (width + 16) * 2, row_bytes);
@@ -78,7 +78,7 @@ __global__ void expand_dispatch_kernel(const void* hidden, const int* ids,
     }
     // Refresh only current per-expert padding; unused capacity stays unconsumed.
     memset(row_values, 0, row_bytes);
-    for (int expert = static_cast<int>(threadIdx); expert < 24; expert += threadDim) {
+    for (int expert = static_cast<int>(threadIdx); expert < 384 / (dp_size * 4); expert += threadDim) {
         const int end = expert_prefix[expert];
         const int padding = padded_counts[expert] - expert_counts[expert];
         for (int row = end; row < end + padding; ++row) {
@@ -162,11 +162,11 @@ extern "C" sdaaError_t deep_ep_expand_dispatch(sdaaStream_t stream,
     const void* hidden, const int* ids, const float* weights, const int* counts,
     void* output, float* out_weights, int* rank_prefix, int* expert_prefix,
     int* expert_counts, int* padded_counts, int* route_slots, int* source,
-    int capacity, int expanded_capacity, int width, int rank, int alignment,
+    int capacity, int expanded_capacity, int width, int rank, int dp_size, int alignment,
     int64_t* status) {
     expand_dispatch_kernel<<<1, stream>>>(hidden, ids, weights, counts, output,
         out_weights, rank_prefix, expert_prefix, expert_counts, padded_counts,
-        route_slots, source, capacity, expanded_capacity, width, rank, alignment, status);
+        route_slots, source, capacity, expanded_capacity, width, rank, dp_size, alignment, status);
     return sdaaGetLastError();
 }
 extern "C" sdaaError_t deep_ep_combine_expanded(sdaaStream_t stream,

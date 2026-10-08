@@ -21,7 +21,9 @@ void bind_sdaa_routing(pybind11::module_& m) {
         const at::Tensor& weights, const at::Tensor& counts, at::Tensor output,
         at::Tensor out_weights, at::Tensor ranks, at::Tensor experts,
         at::Tensor expert_counts, at::Tensor padded_counts, at::Tensor route_slots,
-        at::Tensor source, int rank, at::Tensor status, int alignment) {
+        at::Tensor source, int rank, at::Tensor status, int alignment, int dp_size) {
+        TORCH_CHECK(dp_size == 4 || dp_size == 8, "DeepEP SDAA requires EP16 or EP32");
+        const int local_experts = 384 / (dp_size * 4);
         TORCH_CHECK(hidden.dim() == 2 && output.dim() == 2 &&
             output.device().type() == at::kPrivateUse1,
             "DeepEP expanded hidden/output must be SDAA matrices");
@@ -32,27 +34,27 @@ void bind_sdaa_routing(pybind11::module_& m) {
         check_tensor(out_weights, at::kFloat, output); check_status(status, output);
         for (const auto& tensor : {counts, ranks, experts, expert_counts, padded_counts,
                                   route_slots, source}) check_tensor(tensor, at::kInt, output);
-        TORCH_CHECK(capacity > 0 && capacity % 4 == 0 &&
+        TORCH_CHECK(capacity > 0 && capacity % dp_size == 0 &&
             capacity <= std::numeric_limits<int>::max() / 6 &&
             expanded_capacity <= std::numeric_limits<int>::max() &&
             alignment > 0 && (alignment & (alignment - 1)) == 0 &&
-            expanded_capacity == capacity * 6 + 24LL * (alignment - 1) &&
+            expanded_capacity == capacity * 6 + int64_t(local_experts) * (alignment - 1) &&
             width == 5120 && hidden.size(1) == width + 16 &&
             ids.sizes() == at::IntArrayRef({capacity, 6}) && weights.sizes() == ids.sizes() &&
-            counts.sizes() == at::IntArrayRef({5}) && ranks.sizes() == at::IntArrayRef({16}) &&
-            experts.sizes() == at::IntArrayRef({24}) &&
-            expert_counts.sizes() == at::IntArrayRef({24}) &&
-            padded_counts.sizes() == at::IntArrayRef({24}) &&
+            counts.sizes() == at::IntArrayRef({dp_size + 1}) && ranks.sizes() == at::IntArrayRef({dp_size * 4}) &&
+            experts.sizes() == at::IntArrayRef({local_experts}) &&
+            expert_counts.sizes() == at::IntArrayRef({local_experts}) &&
+            padded_counts.sizes() == at::IntArrayRef({local_experts}) &&
             out_weights.sizes() == at::IntArrayRef({expanded_capacity}) &&
             route_slots.sizes() == at::IntArrayRef({capacity, 6}) &&
-            source.sizes() == at::IntArrayRef({capacity, 2}) && rank >= 0 && rank < 16,
+            source.sizes() == at::IntArrayRef({capacity, 2}) && rank >= 0 && rank < dp_size * 4,
             "DeepEP expert-major expanded shape/topology/alignment mismatch");
         ep_sdaa_check(deep_ep_expand_dispatch(torch::sdaa::getCurrentSDAAStream(-1),
             hidden.const_data_ptr(), ids.const_data_ptr<int>(), weights.const_data_ptr<float>(),
             counts.const_data_ptr<int>(), output.data_ptr(), out_weights.data_ptr<float>(),
             ranks.data_ptr<int>(), experts.data_ptr<int>(), expert_counts.data_ptr<int>(),
             padded_counts.data_ptr<int>(), route_slots.data_ptr<int>(), source.data_ptr<int>(),
-            capacity, expanded_capacity, width, rank, alignment, status.data_ptr<int64_t>()),
+            capacity, expanded_capacity, width, rank, dp_size, alignment, status.data_ptr<int64_t>()),
             "deep_ep_expand_dispatch", "expand_dispatch", __LINE__);
     });
     m.def("combine_expanded", [](const at::Tensor& input, const at::Tensor& route_slots,

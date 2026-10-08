@@ -21,21 +21,22 @@ DEEP_EP_LAYOUT_INLINE void layout_error(int64_t* status, int64_t code,
 DEEP_EP_LAYOUT_INLINE int build_expanded_layout(const uint16_t* hidden, const int* ids,
     const int* counts, int* rank_prefix, int* expert_prefix, int* expert_counts,
     int* padded_counts, int* route_slots, int* source, int capacity,
-    int expanded_capacity, int width, int rank, int alignment, int64_t* status) {
+    int expanded_capacity, int width, int rank, int dp_size, int alignment, int64_t* status) {
+    const int local_experts = 384 / (dp_size * 4);
     for (int row = 0; row < capacity; ++row) {
         for (int k = 0; k < 6; ++k) route_slots[row * 6 + k] = -1;
         source[row * 2] = source[row * 2 + 1] = -1;
     }
-    for (int i = 0; i < 24; ++i) {
+    for (int i = 0; i < local_experts; ++i) {
         expert_prefix[i] = expert_counts[i] = padded_counts[i] = 0;
     }
-    for (int i = 0; i < 16; ++i) rank_prefix[i] = 0;
+    for (int i = 0; i < dp_size * 4; ++i) rank_prefix[i] = 0;
     if (status[0] != 0) return -1;
     int local_counts[24] = {};
     int cursors[24] = {};
-    const int first = rank * 24;
+    const int first = rank * local_experts;
     int total = 0, deduplicated = 0;
-    for (int dp = 0; dp < 4; ++dp) {
+    for (int dp = 0; dp < dp_size; ++dp) {
         if (counts[dp] < 0 || counts[dp] > capacity - total) {
             layout_error(status, 5, dp, counts[dp], capacity - total);
             return -1;
@@ -49,7 +50,7 @@ DEEP_EP_LAYOUT_INLINE int build_expanded_layout(const uint16_t* hidden, const in
                     layout_error(status, 6, row * 6 + k, id, 384);
                     return -1;
                 }
-                if (id >= first && id < first + 24) {
+                if (id >= first && id < first + local_experts) {
                     ++local_counts[id - first];
                     present = true;
                 }
@@ -57,8 +58,8 @@ DEEP_EP_LAYOUT_INLINE int build_expanded_layout(const uint16_t* hidden, const in
             if (present) {
                 const auto source_row = hidden[
                     static_cast<long>(row) * (width + 16) + width];
-                if (source_row >= capacity / 4) {
-                    layout_error(status, 7, row, source_row, capacity / 4);
+                if (source_row >= capacity / dp_size) {
+                    layout_error(status, 7, row, source_row, capacity / dp_size);
                     return -1;
                 }
                 source[row * 2] = dp * 4;
@@ -69,12 +70,12 @@ DEEP_EP_LAYOUT_INLINE int build_expanded_layout(const uint16_t* hidden, const in
         for (int tp = 0; tp < 4; ++tp) rank_prefix[dp * 4 + tp] = deduplicated;
         total = end;
     }
-    if (counts[4] != total) {
-        layout_error(status, 5, 4, counts[4], total);
+    if (counts[dp_size] != total) {
+        layout_error(status, 5, dp_size, counts[dp_size], total);
         return -1;
     }
     int offset = 0;
-    for (int expert = 0; expert < 24; ++expert) {
+    for (int expert = 0; expert < local_experts; ++expert) {
         const int actual = local_counts[expert];
         const int padded = (actual + alignment - 1) & -alignment;
         if (padded > expanded_capacity - offset) {
@@ -91,7 +92,7 @@ DEEP_EP_LAYOUT_INLINE int build_expanded_layout(const uint16_t* hidden, const in
     for (int row = 0; row < total; ++row) {
         for (int k = 0; k < 6; ++k) {
             const int local = ids[row * 6 + k] - first;
-            if (local >= 0 && local < 24)
+            if (local >= 0 && local < local_experts)
                 route_slots[row * 6 + k] = cursors[local]++;
         }
     }
